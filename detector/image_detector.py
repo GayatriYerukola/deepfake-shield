@@ -67,8 +67,8 @@ def analyze_image(file_path: str, use_model: bool = True) -> dict:
         img_gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
 
         h, w = img_gray.shape
-        if w < 64 or h < 64:
-            return _error_result("Image too small for analysis (minimum 64×64 px).")
+        if w < 16 or h < 16:
+            return _error_result("Image too small for analysis (minimum 16×16 px).")
 
         # ── Tier 2: Classical heuristics (always run) ─────────────────────
         meta_result    = check_metadata(file_path)
