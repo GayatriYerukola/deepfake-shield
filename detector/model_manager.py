@@ -41,7 +41,9 @@ class ModelManager:
     """
 
     def __init__(self):
-        self._pipeline  = None
+        self._pipeline     = None
+        self._custom_model = None   # FFTCNNModel instance
+        self._is_custom    = False
         self._model_id: Optional[str] = None
         self._error:    Optional[str] = None
 
@@ -66,27 +68,42 @@ class ModelManager:
         self._error    = None
 
         try:
-            from transformers import pipeline as hf_pipeline
             from pathlib import Path as _Path
+            local_path = _Path(model_id)
 
-            # Support local fine-tuned model paths as well as HuggingFace IDs
-            source = str(_Path(model_id).resolve()) if _Path(model_id).exists() else model_id
+            # ── Custom FFT-CNN model (.pkl or .pth or .pth.zip) ───────────
+            if local_path.exists() and local_path.suffix.lower() in (
+                ".pkl", ".pth", ".zip"
+            ):
+                from detector.custom_model import load_fft_cnn_model
+                logger.info("Loading custom FFT-CNN model from: %s", model_id)
+                self._custom_model = load_fft_cnn_model(str(local_path))
+                self._pipeline     = None   # not used for custom model
+                self._model_id     = model_id
+                self._is_custom    = True
+                logger.info("Custom model ready.")
+                return True
 
-            logger.info("Loading model: %s", source)
-            self._pipeline = hf_pipeline(
+            # ── HuggingFace pipeline (ViT or any image-classification model) ──
+            from transformers import pipeline as hf_pipeline
+            source = str(local_path.resolve()) if local_path.exists() else model_id
+            logger.info("Loading HuggingFace model: %s", source)
+            self._pipeline    = hf_pipeline(
                 "image-classification",
                 model=source,
-                device=-1,          # CPU; set to 0 for first CUDA GPU
-                top_k=None,         # return all label probabilities
+                device=-1,
+                top_k=None,
             )
-            self._model_id = model_id   # keep original name/path for display
+            self._custom_model = None
+            self._model_id     = model_id
+            self._is_custom    = False
             logger.info("Model ready.")
             return True
 
         except ImportError:
             self._error = (
                 "PyTorch / Transformers not installed.\n"
-                "Fix: pip install torch transformers"
+                "Fix: pip install torch transformers torchvision"
             )
             logger.error(self._error)
             return False
@@ -100,25 +117,45 @@ class ModelManager:
         """
         Run deepfake detection inference on one image.
 
-        Parameters
-        ----------
-        image_path : str  Absolute or relative path to the image file.
+        Automatically routes to the correct backend:
+          - Custom FFT-CNN model (.pkl/.pth)  → direct PyTorch inference
+          - HuggingFace ViT pipeline          → transformers pipeline inference
 
         Returns
         -------
         dict
             fake_score : float  0-1  probability the image is AI/fake
             real_score : float  0-1  probability the image is authentic
-            raw        : list   raw HuggingFace output (label + score pairs)
             model_id   : str
         """
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call model_manager.load() first.")
 
-        from PIL import Image
-        img     = Image.open(image_path).convert("RGB")
-        raw     = self._pipeline(img)           # list of {label, score}
+        # ── Custom FFT-CNN model ──────────────────────────────────────────
+        if self._is_custom and self._custom_model is not None:
+            import torch
+            from detector.custom_model import preprocess_image
 
+            tensor = preprocess_image(image_path)
+            with torch.no_grad():
+                logits = self._custom_model(tensor)
+                probs  = torch.softmax(logits, dim=1)[0]
+
+            real_score = float(probs[0])
+            fake_score = float(probs[1])
+
+            return {
+                "fake_score": round(fake_score, 4),
+                "real_score": round(real_score, 4),
+                "raw":        [{"label": "Real", "score": real_score},
+                               {"label": "Fake", "score": fake_score}],
+                "model_id":   self._model_id,
+            }
+
+        # ── HuggingFace pipeline ──────────────────────────────────────────
+        from PIL import Image
+        img        = Image.open(image_path).convert("RGB")
+        raw        = self._pipeline(img)
         fake_score, real_score = self._parse_scores(raw)
 
         return {
@@ -146,7 +183,7 @@ class ModelManager:
 
     @property
     def is_loaded(self) -> bool:
-        return self._pipeline is not None
+        return self._pipeline is not None or self._custom_model is not None
 
     @property
     def load_error(self) -> Optional[str]:
